@@ -1,0 +1,2047 @@
+import os
+import logging
+import asyncio
+
+import psycopg2
+from psycopg2 import pool as pg_pool
+from psycopg2.extras import RealDictCursor
+
+from datetime import datetime, timezone
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+TOKEN = os.getenv("BOT_TOKEN", "")
+
+SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID", "0"))
+
+_staff_env = os.getenv("AUTHORIZED_STAFF_IDS", "")
+ENV_AUTHORIZED_STAFF = {
+    int(x.strip()) for x in _staff_env.split(",") if x.strip().isdigit()
+}
+
+AUTHORIZED_STAFF: set[int] = set(ENV_AUTHORIZED_STAFF)
+
+# ============================================================
+# GAMES
+# ============================================================
+
+GAMES = [
+    "Orionstars",
+    "Firekirin",
+    "Ultrapanda",
+    "Juwa",
+    "GameVault",
+    "Riversweeps",
+    "Milkyway",
+    "Vblink",
+    "Gameroom",
+]
+
+# ============================================================
+# TRAFFIC SOURCES
+# Deep-link parameter → readable label mapping
+# t.me/YourBot?start=website        → "🌐 Website"
+# t.me/YourBot?start=facebook       → "📘 Facebook"
+# t.me/YourBot?start=src_website    → "🌐 Website"   (safe/explicit form)
+# t.me/YourBot?start=src_facebook   → "📘 Facebook"  (safe/explicit form)
+# ============================================================
+
+TRAFFIC_SOURCES = {
+    "website":  "🌐 Website",
+    "facebook": "📘 Facebook",
+    # Future ke liye:
+    # "tiktok":   "🎵 TikTok",
+    # "youtube":  "▶️ YouTube",
+    # "reddit":   "🟠 Reddit",
+    # "instagram":"📷 Instagram",
+    # "twitter":  "🐦 Twitter",
+}
+
+# ============================================================
+# BONUS OPTIONS
+# ============================================================
+
+BONUS_OPTIONS = {
+    "signup120":  "💰 120% Signup Bonus",
+    "freeplay":   "🎁 Redeemable Freeplay",
+}
+
+# ============================================================
+# SPAM / FLOOD PROTECTION
+# ============================================================
+
+MIN_GAP_SECONDS = 0.4
+MAX_QUEUE_SIZE = 30
+WORKER_IDLE_TIMEOUT = 5
+
+_user_queues: dict[int, asyncio.Queue] = {}
+_user_workers: dict[int, asyncio.Task] = {}
+
+# ============================================================
+# BACKGROUND TASK REGISTRY
+#
+# asyncio only keeps a WEAK reference to tasks created via
+# asyncio.create_task(). If nothing else references the task object,
+# it can be garbage-collected mid-execution — silently killing a
+# "fire and forget" background job (e.g. topic creation / group
+# notify) before it finishes, with no error raised anywhere.
+# This registry keeps a strong reference until each task completes.
+# ============================================================
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def fire_and_forget(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _get_or_create_queue(user_id: int) -> asyncio.Queue:
+    if user_id not in _user_queues:
+        _user_queues[user_id] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+    return _user_queues[user_id]
+
+
+async def _queue_worker(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+
+    queue = _user_queues[user_id]
+
+    try:
+        while True:
+
+            try:
+                user, update, topic_id = await asyncio.wait_for(
+                    queue.get(), timeout=WORKER_IDLE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                break
+
+            try:
+                success = await _forward_customer_message(
+                    user=user,
+                    update=update,
+                    context=context,
+                    topic_id=topic_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Unexpected error forwarding message for user %s", user_id
+                )
+                success = False
+
+            if not success:
+                try:
+                    await update.message.reply_text(
+                        "⚠️ Could not send message. Please try again."
+                    )
+                except Exception:
+                    pass
+
+            await asyncio.sleep(MIN_GAP_SECONDS)
+
+    finally:
+        _user_workers.pop(user_id, None)
+        _user_queues.pop(user_id, None)
+
+
+async def enqueue_customer_message(
+    user,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    topic_id: int,
+):
+    queue = _get_or_create_queue(user.id)
+
+    try:
+        queue.put_nowait((user, update, topic_id))
+
+    except asyncio.QueueFull:
+        await update.message.reply_text(
+            "⚠️ Bohot zyada messages ek sath aa rahe hain — "
+            "thoda ruk ke bhejein, hum sab dekh lenge."
+        )
+        return
+
+    existing = _user_workers.get(user.id)
+    if existing is None or existing.done():
+        _user_workers[user.id] = asyncio.create_task(
+            _queue_worker(user.id, context)
+        )
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+_pool: pg_pool.ThreadedConnectionPool | None = None
+
+
+def _get_pool() -> pg_pool.ThreadedConnectionPool:
+
+    global _pool
+
+    database_url = os.getenv("DATABASE_URL", "")
+
+    if not database_url:
+        raise Exception(
+            "DATABASE_URL not set! "
+            "Railway pe PostgreSQL add karo."
+        )
+
+    if _pool is None:
+        _pool = pg_pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=database_url,
+            cursor_factory=RealDictCursor,
+        )
+        logger.info("PostgreSQL connection pool created.")
+
+    return _pool
+
+
+def _run(fn, *args, **kwargs):
+
+    pool = _get_pool()
+    conn = pool.getconn()
+
+    try:
+        with conn.cursor() as cur:
+            result = fn(cur, *args, **kwargs)
+        conn.commit()
+        return result
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        pool.putconn(conn)
+
+
+def init_db():
+
+    def _init(cur):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id       BIGINT PRIMARY KEY,
+                name          TEXT NOT NULL DEFAULT '',
+                username      TEXT NOT NULL DEFAULT '',
+                topic_id      BIGINT,
+                topic_status  TEXT NOT NULL DEFAULT 'open',
+                game          TEXT,
+                source        TEXT,
+                bonus         TEXT,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS topics (
+                topic_id    BIGINT PRIMARY KEY,
+                user_id     BIGINT NOT NULL
+                            REFERENCES users(user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS staff (
+                user_id     BIGINT PRIMARY KEY,
+                name        TEXT NOT NULL DEFAULT '',
+                added_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS topic_status TEXT NOT NULL DEFAULT 'open';
+        """)
+
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS source TEXT;
+        """)
+
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS bonus TEXT;
+        """)
+
+    _run(_init)
+    logger.info("Database initialized.")
+
+
+def _load_staff_sync(cur):
+    cur.execute("SELECT user_id FROM staff")
+    return {row["user_id"] for row in cur.fetchall()}
+
+
+def load_staff_into_memory():
+    db_staff = _run(_load_staff_sync)
+    AUTHORIZED_STAFF.update(db_staff)
+    logger.info("Authorized staff loaded: %s", AUTHORIZED_STAFF)
+
+
+# ============================================================
+# DB HELPERS
+# ============================================================
+
+async def db_get_user(user_id: int):
+
+    def _q(cur):
+        cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+        return cur.fetchone()
+
+    return await asyncio.to_thread(_run, _q)
+
+
+async def db_upsert_user(
+    user_id: int,
+    name: str,
+    username: str,
+    topic_id: int | None = None,
+    game: str | None = None,
+    topic_status: str | None = None,
+    source: str | None = None,
+    bonus: str | None = None,
+):
+
+    def _q(cur):
+        cur.execute("""
+            INSERT INTO users
+                (user_id, name, username, topic_id, game, topic_status, source, bonus)
+            VALUES (%s, %s, %s, %s, %s, COALESCE(%s, 'open'), %s, %s)
+            ON CONFLICT(user_id) DO UPDATE SET
+                name         = EXCLUDED.name,
+                username     = EXCLUDED.username,
+                topic_id     = COALESCE(EXCLUDED.topic_id, users.topic_id),
+                game         = COALESCE(EXCLUDED.game, users.game),
+                topic_status = COALESCE(%s, users.topic_status),
+                source       = COALESCE(EXCLUDED.source, users.source),
+                bonus        = COALESCE(EXCLUDED.bonus, users.bonus),
+                last_seen    = NOW()
+        """, (
+            user_id, name, username, topic_id, game,
+            topic_status, source, bonus, topic_status
+        ))
+
+    await asyncio.to_thread(_run, _q)
+
+
+async def db_get_user_by_topic(topic_id: int):
+
+    def _q(cur):
+        cur.execute("SELECT * FROM users WHERE topic_id = %s", (topic_id,))
+        return cur.fetchone()
+
+    return await asyncio.to_thread(_run, _q)
+
+
+async def db_add_topic_mapping(topic_id: int, user_id: int):
+
+    def _q(cur):
+        cur.execute("""
+            INSERT INTO topics (topic_id, user_id)
+            VALUES (%s, %s)
+            ON CONFLICT(topic_id) DO UPDATE SET
+                user_id = EXCLUDED.user_id
+        """, (topic_id, user_id))
+
+    await asyncio.to_thread(_run, _q)
+
+
+async def db_set_topic_status(user_id: int, status: str):
+
+    def _q(cur):
+        cur.execute(
+            "UPDATE users SET topic_status = %s WHERE user_id = %s",
+            (status, user_id)
+        )
+
+    await asyncio.to_thread(_run, _q)
+
+
+async def db_clear_user_topic(user_id: int, topic_id: int):
+
+    def _q(cur):
+        cur.execute(
+            "UPDATE users SET topic_id = NULL, topic_status = 'open' "
+            "WHERE user_id = %s",
+            (user_id,)
+        )
+        cur.execute("DELETE FROM topics WHERE topic_id = %s", (topic_id,))
+
+    await asyncio.to_thread(_run, _q)
+
+
+async def db_get_all_users():
+
+    def _q(cur):
+        cur.execute("SELECT * FROM users")
+        return cur.fetchall()
+
+    return await asyncio.to_thread(_run, _q)
+
+
+async def db_add_staff(user_id: int, name: str):
+
+    def _q(cur):
+        cur.execute("""
+            INSERT INTO staff (user_id, name)
+            VALUES (%s, %s)
+            ON CONFLICT(user_id) DO UPDATE SET name = EXCLUDED.name
+        """, (user_id, name))
+
+    await asyncio.to_thread(_run, _q)
+
+
+async def db_remove_staff(user_id: int):
+
+    def _q(cur):
+        cur.execute("DELETE FROM staff WHERE user_id = %s", (user_id,))
+
+    await asyncio.to_thread(_run, _q)
+
+
+# ============================================================
+# PER-USER LOCKS
+# ============================================================
+
+TOPIC_CREATION_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _get_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in TOPIC_CREATION_LOCKS:
+        TOPIC_CREATION_LOCKS[user_id] = asyncio.Lock()
+    return TOPIC_CREATION_LOCKS[user_id]
+
+
+def _release_lock_if_idle(user_id: int):
+    lock = TOPIC_CREATION_LOCKS.get(user_id)
+    if lock and not lock.locked():
+        TOPIC_CREATION_LOCKS.pop(user_id, None)
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def games_keyboard():
+
+    buttons = []
+
+    for i in range(0, len(GAMES), 2):
+
+        row = [
+            InlineKeyboardButton(
+                f"🎮 {GAMES[i]}",
+                callback_data=f"game:{GAMES[i]}"
+            )
+        ]
+
+        if i + 1 < len(GAMES):
+
+            row.append(
+                InlineKeyboardButton(
+                    f"🎮 {GAMES[i + 1]}",
+                    callback_data=f"game:{GAMES[i + 1]}"
+                )
+            )
+
+        buttons.append(row)
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def bonus_keyboard():
+    """
+    Start ke baad customer ko dikhne wale 2 bonus buttons.
+    """
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "💰 120% Signup Bonus",
+                callback_data="bonus:signup120"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎁 Redeemable Freeplay",
+                callback_data="bonus:freeplay"
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(buttons)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_player_name(user) -> str:
+
+    name = (
+        user.full_name
+        or user.first_name
+        or "Unknown Player"
+    )
+
+    name = name.replace("\n", " ").strip()
+
+    if user.username:
+        return f"{name} (@{user.username})"
+
+    return f"{name} [ID: {user.id}]"
+
+
+def is_authorized(message) -> bool:
+
+    if not message.from_user:
+        return False
+
+    return message.from_user.id in AUTHORIZED_STAFF
+
+
+def _parse_deeplink_game(args: list[str]) -> str | None:
+
+    if not args:
+        return None
+
+    param = args[0].lower().strip()
+
+    for game in GAMES:
+
+        if game.lower() == param:
+            return game
+
+    return None
+
+
+def _parse_deeplink_source(args: list[str]) -> str | None:
+    """
+    Deep-link se traffic source detect karo.
+
+    Backward compatible:  ?start=website        / ?start=facebook
+    Safe explicit form:   ?start=src_website     / ?start=src_facebook
+    (the src_ prefix avoids any future clash with game-name deep links)
+    """
+
+    if not args:
+        return None
+
+    param = args[0].lower().strip()
+
+    if param.startswith("src_"):
+        key = param[4:]
+        return TRAFFIC_SOURCES.get(key)
+
+    if param in TRAFFIC_SOURCES:
+        return TRAFFIC_SOURCES[param]
+
+    return None
+
+
+# ============================================================
+# CLOSED / MISSING TOPIC ERROR DETECTION
+# ============================================================
+
+def _is_closed_topic_error(error: TelegramError) -> bool:
+
+    error_lower = str(error).lower()
+
+    closed_keywords = [
+        "topic_closed",
+        "thread_not_found",
+        "message thread not found",
+    ]
+
+    return any(kw in error_lower for kw in closed_keywords)
+
+
+# ============================================================
+# TOPIC CREATION / REOPEN
+# ============================================================
+
+async def get_or_create_topic(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    pre_selected_game: str | None = None,
+    source: str | None = None,
+) -> int | None:
+
+    user_id = user.id
+    lock = _get_lock(user_id)
+
+    async with lock:
+
+        row = await db_get_user(user_id)
+
+        if row and row["topic_id"]:
+
+            if row.get("topic_status") == "closed":
+                topic_id = await _reopen_or_recreate_topic(
+                    user, row["topic_id"], context
+                )
+            else:
+                topic_id = row["topic_id"]
+
+            # Existing customer: still persist any new deep-link info
+            # (game/source) that arrived on this visit — this was previously
+            # silently dropped for returning customers.
+            if topic_id and (pre_selected_game or source):
+                await db_upsert_user(
+                    user_id=user_id,
+                    name=user.full_name or user.first_name or "Unknown",
+                    username=user.username or "",
+                    game=pre_selected_game,
+                    source=source,
+                )
+
+        else:
+            topic_id = await _create_new_topic(
+                user,
+                context,
+                pre_selected_game=pre_selected_game,
+                source=source,
+            )
+
+    _release_lock_if_idle(user_id)
+    return topic_id
+
+
+async def _create_new_topic(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    pre_selected_game: str | None = None,
+    source: str | None = None,
+) -> int | None:
+    """
+    Source ab welcome message mein include hota hai
+    aur database mein save hota hai.
+    """
+
+    topic_name = get_player_name(user)[:120]
+
+    try:
+
+        topic = await context.bot.create_forum_topic(
+            chat_id=SUPPORT_GROUP_ID,
+            name=topic_name
+        )
+
+        topic_id = topic.message_thread_id
+
+        existing = await db_get_user(user.id)
+
+        existing_game = (
+            existing["game"]
+            if existing and existing["game"]
+            else pre_selected_game
+        )
+
+        # Source preserve karo agar pehle se hai
+        existing_source = (
+            existing["source"]
+            if existing and existing.get("source")
+            else source
+        )
+
+        await db_upsert_user(
+            user_id=user.id,
+            name=user.full_name or user.first_name or "Unknown",
+            username=user.username or "",
+            topic_id=topic_id,
+            game=existing_game,
+            topic_status="open",
+            source=existing_source,
+        )
+
+        await db_add_topic_mapping(topic_id, user.id)
+
+        game_line = (
+            f"🎮 Game     : {existing_game}"
+            if existing_game
+            else "🎮 Game     : Not selected yet"
+        )
+
+        source_line = (
+            f"📊 Source   : {existing_source}"
+            if existing_source
+            else "📊 Source   : Direct/Unknown"
+        )
+
+        entry_line = (
+            "🔗 Entry    : Deep-link"
+            if pre_selected_game or source
+            else "🔗 Entry    : Direct"
+        )
+
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            text=(
+                "👤 NEW PLAYER CONNECTED\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Name     : {user.full_name or user.first_name or 'Unknown'}\n"
+                f"Username : @{user.username or 'No username'}\n"
+                f"ID       : {user.id}\n"
+                f"{game_line}\n"
+                f"{source_line}\n"
+                f"{entry_line}\n\n"
+                "💬 Customer messages below.\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+        )
+
+        logger.info(
+            "Created topic %s for customer %s | game: %s | source: %s",
+            topic_id, user.id, existing_game or "none", existing_source or "none"
+        )
+
+        return topic_id
+
+    except TelegramError as e:
+
+        logger.error("Topic creation failed: %s", e)
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    "⚠️ Support system temporarily unavailable. "
+                    "Please try again."
+                )
+            )
+
+        except Exception:
+            pass
+
+        return None
+
+
+async def _reopen_or_recreate_topic(
+    user,
+    topic_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int | None:
+
+    try:
+
+        await context.bot.reopen_forum_topic(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id
+        )
+
+        await db_set_topic_status(user.id, "open")
+
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            text="🔓 Customer wapas aa gaya — topic reopened."
+        )
+
+        logger.info("Reopened topic %s for user %s", topic_id, user.id)
+
+        return topic_id
+
+    except TelegramError as e:
+
+        logger.warning(
+            "Reopen failed for topic %s (%s) — creating fresh topic",
+            topic_id, e
+        )
+
+        await db_clear_user_topic(user.id, topic_id)
+
+        return await _create_new_topic(user, context)
+
+
+# ============================================================
+# SEND TO GROUP
+# ============================================================
+
+async def _send_to_group(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    topic_id: int,
+    text: str,
+) -> int:
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            text=text
+        )
+
+        return topic_id
+
+    except TelegramError as e:
+
+        if _is_closed_topic_error(e):
+
+            new_topic_id = await _reopen_or_recreate_topic(
+                user, topic_id, context
+            )
+
+            if new_topic_id:
+
+                try:
+
+                    await context.bot.send_message(
+                        chat_id=SUPPORT_GROUP_ID,
+                        message_thread_id=new_topic_id,
+                        text=text
+                    )
+
+                    return new_topic_id
+
+                except TelegramError as e2:
+
+                    logger.error("Send failed after reopen: %s", e2)
+
+        else:
+
+            logger.error("Send to group failed: %s", e)
+
+    return topic_id
+
+
+# ============================================================
+# FORWARD CUSTOMER MESSAGE
+# ============================================================
+
+async def _forward_customer_message(
+    user,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    topic_id: int,
+    _is_retry: bool = False,
+) -> bool:
+
+    try:
+
+        await context.bot.copy_message(
+            chat_id=SUPPORT_GROUP_ID,
+            from_chat_id=user.id,
+            message_id=update.message.message_id,
+            message_thread_id=topic_id
+        )
+
+        logger.info("Customer %s → topic %s", user.id, topic_id)
+
+        return True
+
+    except TelegramError as e:
+
+        if _is_closed_topic_error(e) and not _is_retry:
+
+            new_topic_id = await _reopen_or_recreate_topic(
+                user, topic_id, context
+            )
+
+            if not new_topic_id:
+                return False
+
+            return await _forward_customer_message(
+                user=user,
+                update=update,
+                context=context,
+                topic_id=new_topic_id,
+                _is_retry=True,
+            )
+
+        logger.error("Message forward failed: %s", e)
+
+        return False
+
+
+# ============================================================
+# START — REWORKED
+# User ko HAMESHA turant reply milta hai (Telegram Ads requirement:
+# "bots must respond to commands properly"). Topic creation, DB writes,
+# aur group notify sab background mein (asyncio.create_task) hote hain,
+# taake slow/failed backend user ko blank na chhode.
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    # Deep-link parse karo — game ya source
+    pre_selected_game = _parse_deeplink_game(context.args or [])
+    source = _parse_deeplink_source(context.args or [])
+
+    # 1) USER REPLY FIRST — no backend/topic work before this.
+    if pre_selected_game:
+        await update.message.reply_text(
+            f"👋 Welcome to Lucky Harbor Support!\n\n"
+            f"🎮 Game selected: {pre_selected_game}\n\n"
+            "💬 Send your message — "
+            "our team will assist you right away!"
+        )
+    else:
+        await update.message.reply_text(
+            "👋 Welcome to Lucky Harbor Support!\n\n"
+            "🎁 Choose your bonus:",
+            reply_markup=bonus_keyboard()
+        )
+
+    # 2) Backend work happens after, fire-and-forget (with a strong
+    #    reference kept so it can't be garbage-collected mid-flight).
+    fire_and_forget(
+        _finalize_start(user, context, pre_selected_game, source)
+    )
+
+
+async def _finalize_start(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    pre_selected_game: str | None,
+    source: str | None,
+):
+    """
+    Background work for /start: create/reopen topic, persist game/source,
+    and notify the support group. Failures here are logged only — the
+    user has already received their reply and should never see this fail.
+    """
+
+    try:
+
+        existing = await db_get_user(user.id)
+        is_new_customer = not (existing and existing.get("topic_id"))
+
+        topic_id = await get_or_create_topic(
+            user,
+            context,
+            pre_selected_game=pre_selected_game,
+            source=source,
+        )
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after /start "
+                "(user already received a reply).",
+                user.id,
+            )
+            return
+
+        # New customer: _create_new_topic already posted a full
+        # "NEW PLAYER CONNECTED" card — nothing more to send.
+        if is_new_customer:
+            return
+
+        # Returning customer: every /start still gets forwarded to the
+        # group, so agents always see the activity — just without
+        # re-posting the full "NEW PLAYER CONNECTED" card each time.
+        details = [
+            f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}",
+            f"🔗 Username : @{user.username or 'No username'}",
+            f"🆔 ID       : {user.id}",
+        ]
+
+        if pre_selected_game:
+            details.append(f"🎮 Game     : {pre_selected_game}")
+
+        if source:
+            details.append(f"📊 Source   : {source}")
+
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=(
+                "🔁 CUSTOMER STARTED BOT AGAIN\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                + "\n".join(details) + "\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+        )
+
+    except Exception:
+        logger.exception(
+            "Unhandled error finalizing /start backend work for user %s",
+            user.id,
+        )
+
+
+# ============================================================
+# HELP COMMAND — NEW
+# ============================================================
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "ℹ️ LUCKY HARBOR SUPPORT — HELP\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "/start   — Begin or restart your support chat\n"
+        "/games   — Choose or change your game\n"
+        "/support — Reach our support team\n"
+        "/help    — Show this message\n\n"
+        "💬 You can also just send a message anytime — "
+        "our team will reply right here."
+    )
+
+
+# ============================================================
+# BONUS SELECTION
+# User ko pehle confirmation milta hai, phir DB/group backend mein.
+# ============================================================
+
+async def bonus_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    user = query.from_user
+
+    bonus_key = query.data.replace("bonus:", "", 1)
+
+    if bonus_key not in BONUS_OPTIONS:
+
+        await query.message.reply_text(
+            "⚠️ Invalid bonus selection."
+        )
+
+        return
+
+    bonus_label = BONUS_OPTIONS[bonus_key]
+
+    # 1) USER REPLY FIRST.
+    await query.message.reply_text(
+        f"✅ {bonus_label} selected!\n\n"
+        "🎮 Now choose your game:",
+        reply_markup=games_keyboard()
+    )
+
+    # 2) Backend work after.
+    fire_and_forget(
+        _finalize_bonus_selection(user, context, bonus_label)
+    )
+
+
+async def _finalize_bonus_selection(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    bonus_label: str,
+):
+
+    try:
+
+        topic_id = await get_or_create_topic(user, context)
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after bonus selection "
+                "(user already received a reply).",
+                user.id,
+            )
+            return
+
+        await db_upsert_user(
+            user_id=user.id,
+            name=user.full_name or user.first_name or "Unknown",
+            username=user.username or "",
+            topic_id=topic_id,
+            bonus=bonus_label,
+        )
+
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=f"🎁 BONUS SELECTED: {bonus_label}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Unhandled error finalizing bonus selection for user %s",
+            user.id,
+        )
+
+
+# ============================================================
+# GAMES COMMAND
+# ============================================================
+
+async def games(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    # 1) USER REPLY FIRST.
+    await update.message.reply_text(
+        "🎮 Choose your game:",
+        reply_markup=games_keyboard()
+    )
+
+    # 2) Ensure a topic exists AND notify the group, in the background.
+    fire_and_forget(
+        _finalize_command_touch(update.effective_user, context, "GAMES")
+    )
+
+
+# ============================================================
+# SUPPORT COMMAND
+# ============================================================
+
+async def support(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    # 1) USER REPLY FIRST.
+    await update.message.reply_text(
+        "💬 Select your game (optional):",
+        reply_markup=games_keyboard()
+    )
+
+    # 2) Ensure a topic exists AND notify the group, in the background.
+    fire_and_forget(
+        _finalize_command_touch(update.effective_user, context, "SUPPORT")
+    )
+
+
+async def _finalize_command_touch(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    command_label: str,
+):
+    """
+    Background work for /games and /support: ensures a topic exists and
+    makes sure the group always sees that the customer used the command —
+    same rule as /start: new customers get the full "NEW PLAYER CONNECTED"
+    card from topic creation, returning customers get a short notice here
+    so nothing is ever silently dropped.
+    """
+
+    if not user:
+        return
+
+    try:
+
+        existing = await db_get_user(user.id)
+        is_new_customer = not (existing and existing.get("topic_id"))
+
+        topic_id = await get_or_create_topic(user, context)
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after /%s "
+                "(user already received a reply).",
+                user.id, command_label.lower(),
+            )
+            return
+
+        if is_new_customer:
+            # _create_new_topic already posted the full "NEW PLAYER
+            # CONNECTED" card — nothing more to send.
+            return
+
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=(
+                f"🔁 CUSTOMER USED /{command_label.lower()}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}\n"
+                f"🔗 Username : @{user.username or 'No username'}\n"
+                f"🆔 ID       : {user.id}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+        )
+
+    except Exception:
+        logger.exception(
+            "Unhandled error finalizing /%s for user %s",
+            command_label.lower(), user.id,
+        )
+
+
+# ============================================================
+# GAME SELECTION
+# ============================================================
+
+async def game_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    user = query.from_user
+
+    game = query.data.replace("game:", "", 1)
+
+    if game not in GAMES:
+
+        await query.message.reply_text(
+            "⚠️ Invalid game selection."
+        )
+
+        return
+
+    # 1) USER REPLY FIRST.
+    await query.message.reply_text(
+        f"✅ {game} selected!\n\n"
+        "💬 Send your message — team will reply shortly!"
+    )
+
+    # 2) Backend work after.
+    fire_and_forget(
+        _finalize_game_selection(user, context, game)
+    )
+
+
+async def _finalize_game_selection(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    game: str,
+):
+
+    try:
+
+        topic_id = await get_or_create_topic(user, context)
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after game selection "
+                "(user already received a reply).",
+                user.id,
+            )
+            return
+
+        await db_upsert_user(
+            user_id=user.id,
+            name=user.full_name or user.first_name or "Unknown",
+            username=user.username or "",
+            topic_id=topic_id,
+            game=game,
+        )
+
+        await db_add_topic_mapping(topic_id, user.id)
+
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=f"🎮 GAME SELECTED: {game}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Unhandled error finalizing game selection for user %s",
+            user.id,
+        )
+
+
+# ============================================================
+# CUSTOMER MESSAGE
+# ============================================================
+
+async def customer_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    topic_id = await get_or_create_topic(user, context)
+
+    if not topic_id:
+
+        # Never drop the customer's message silently.
+        try:
+            await update.message.reply_text(
+                "⚠️ Support system temporarily unavailable. "
+                "Please try again in a moment."
+            )
+        except Exception:
+            pass
+
+        return
+
+    await enqueue_customer_message(
+        user=user,
+        update=update,
+        context=context,
+        topic_id=topic_id,
+    )
+
+
+# ============================================================
+# SUPPORT GROUP MESSAGE
+# ============================================================
+
+async def support_group_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    message = update.message
+
+    if message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    topic_id = message.message_thread_id
+
+    if not topic_id or topic_id == 1:
+        return
+
+    row = await db_get_user_by_topic(topic_id)
+
+    if not row:
+        return
+
+    customer_id = int(row["user_id"])
+
+    try:
+
+        await context.bot.copy_message(
+            chat_id=customer_id,
+            from_chat_id=SUPPORT_GROUP_ID,
+            message_id=message.message_id
+        )
+
+        logger.info(
+            "Agent reply → customer %s | topic %s",
+            customer_id,
+            topic_id
+        )
+
+    except TelegramError as e:
+
+        logger.error("Reply delivery failed: %s", e)
+
+        error_lower = str(e).lower()
+
+        if any(kw in error_lower for kw in [
+            "blocked",
+            "bot was blocked",
+            "user is deactivated",
+            "chat not found",
+            "forbidden",
+        ]):
+
+            warning_text = (
+                "⚠️ DELIVERY FAILED\n\n"
+                "Customer ne bot block kar diya hai "
+                "ya account deactivate hai.\n"
+                "Reply deliver nahi hua."
+            )
+
+        else:
+
+            warning_text = (
+                f"⚠️ Reply delivery error: {e}\n"
+                "Please try again."
+            )
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=SUPPORT_GROUP_ID,
+                message_thread_id=topic_id,
+                text=warning_text
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# /stats COMMAND — with source breakdown
+# ============================================================
+
+async def stats(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    if update.message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if not is_authorized(update.message):
+
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    def _q(cur):
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        total = cur.fetchone()["c"]
+
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM users "
+            "WHERE created_at >= NOW() - INTERVAL '1 day'"
+        )
+        new_today = cur.fetchone()["c"]
+
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM users "
+            "WHERE topic_id IS NOT NULL AND topic_status = 'open'"
+        )
+        active = cur.fetchone()["c"]
+
+        cur.execute("""
+            SELECT game, COUNT(*) AS c
+            FROM users
+            WHERE game IS NOT NULL
+            GROUP BY game
+            ORDER BY c DESC
+        """)
+        game_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT source, COUNT(*) AS c
+            FROM users
+            WHERE source IS NOT NULL
+            GROUP BY source
+            ORDER BY c DESC
+        """)
+        source_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT bonus, COUNT(*) AS c
+            FROM users
+            WHERE bonus IS NOT NULL
+            GROUP BY bonus
+            ORDER BY c DESC
+        """)
+        bonus_rows = cur.fetchall()
+
+        return total, new_today, active, game_rows, source_rows, bonus_rows
+
+    total, new_today, active, game_rows, source_rows, bonus_rows = \
+        await asyncio.to_thread(_run, _q)
+
+    if game_rows:
+        game_lines = "\n".join(
+            f"  {row['game']:<15} {row['c']} players"
+            for row in game_rows
+        )
+    else:
+        game_lines = "  No game data yet."
+
+    if source_rows:
+        source_lines = "\n".join(
+            f"  {row['source']:<20} {row['c']} players"
+            for row in source_rows
+        )
+    else:
+        source_lines = "  No source data yet."
+
+    if bonus_rows:
+        bonus_lines = "\n".join(
+            f"  {row['bonus']:<25} {row['c']} players"
+            for row in bonus_rows
+        )
+    else:
+        bonus_lines = "  No bonus data yet."
+
+    await update.message.reply_text(
+        "📊 BOT STATISTICS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Total Customers : {total}\n"
+        f"🆕 New Today       : {new_today}\n"
+        f"💬 Active Topics   : {active}\n\n"
+        "🎮 GAME BREAKDOWN\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{game_lines}\n\n"
+        "📊 SOURCE BREAKDOWN\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{source_lines}\n\n"
+        "🎁 BONUS BREAKDOWN\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{bonus_lines}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ============================================================
+# /broadcast COMMAND
+# ============================================================
+
+async def broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    if update.message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if not is_authorized(update.message):
+
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    broadcast_text = " ".join(context.args or []).strip()
+
+    if not broadcast_text:
+
+        await update.message.reply_text(
+            "⚠️ Usage: /broadcast <message>\n\n"
+            "Personalize with {name}:\n"
+            "/broadcast Hi {name}, naya game added!"
+        )
+
+        return
+
+    all_users = await db_get_all_users()
+
+    if not all_users:
+
+        await update.message.reply_text(
+            "❌ No customers in database yet."
+        )
+
+        return
+
+    progress_msg = await update.message.reply_text(
+        f"📡 Broadcasting to {len(all_users)} customers..."
+    )
+
+    success_count = 0
+    fail_count = 0
+
+    for row in all_users:
+
+        try:
+
+            first_name = (row["name"] or "there").split(" ")[0]
+            personalized = broadcast_text.replace("{name}", first_name)
+
+            await context.bot.send_message(
+                chat_id=row["user_id"],
+                text=f"📢 Lucky Harbor Update\n\n{personalized}"
+            )
+
+            success_count += 1
+
+            await asyncio.sleep(0.05)
+
+        except TelegramError as e:
+
+            fail_count += 1
+
+            logger.warning(
+                "Broadcast failed for user %s: %s",
+                row["user_id"],
+                e
+            )
+
+    try:
+
+        await progress_msg.edit_text(
+            "📡 BROADCAST COMPLETE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Delivered : {success_count}\n"
+            f"❌ Failed    : {fail_count}\n"
+            f"📨 Total     : {len(all_users)}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# /id COMMAND — with source & bonus
+# ============================================================
+
+async def customer_info(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    message = update.message
+
+    if message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if not is_authorized(message):
+
+        await message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    topic_id = message.message_thread_id
+
+    if not topic_id:
+
+        await message.reply_text(
+            "⚠️ Use /id inside a customer topic."
+        )
+
+        return
+
+    row = await db_get_user_by_topic(topic_id)
+
+    if not row:
+
+        await message.reply_text(
+            "❌ No customer connected to this topic."
+        )
+
+        return
+
+    username = row["username"] or ""
+    game = row["game"] or "Not selected"
+    source = row.get("source") or "Direct/Unknown"
+    bonus = row.get("bonus") or "Not selected"
+
+    await message.reply_text(
+        "📋 CUSTOMER INFORMATION\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Name     : {row['name']}\n"
+        f"🔗 Username : @{username or 'No username'}\n"
+        f"🆔 ID       : {row['user_id']}\n"
+        f"🎮 Game     : {game}\n"
+        f"🎁 Bonus    : {bonus}\n"
+        f"📊 Source   : {source}\n"
+        f"📌 Topic ID : {topic_id}\n"
+        f"📅 Joined   : {row['created_at']}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ============================================================
+# /close COMMAND
+# ============================================================
+
+async def close_topic(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    message = update.message
+
+    if message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if not is_authorized(message):
+
+        await message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    topic_id = message.message_thread_id
+
+    if not topic_id or topic_id == 1:
+
+        await message.reply_text(
+            "⚠️ Use /close inside a customer topic."
+        )
+
+        return
+
+    row = await db_get_user_by_topic(topic_id)
+
+    if not row:
+
+        await message.reply_text(
+            "❌ No customer connected to this topic."
+        )
+
+        return
+
+    customer_id = int(row["user_id"])
+
+    try:
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text=(
+                    "✅ Support conversation closed.\n\n"
+                    "Need help again? Just send a message!"
+                )
+            )
+
+        except TelegramError:
+            pass
+
+        await context.bot.close_forum_topic(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id
+        )
+
+        await db_set_topic_status(customer_id, "closed")
+
+        await message.reply_text(
+            "✅ Topic closed.\n"
+            "Customer dobara message kare to yehi topic reopen hoga."
+        )
+
+        logger.info(
+            "Topic %s closed | customer %s",
+            topic_id,
+            customer_id
+        )
+
+    except TelegramError as e:
+
+        logger.error("Topic close failed: %s", e)
+
+        await message.reply_text(
+            f"⚠️ Error closing topic: {e}"
+        )
+
+
+# ============================================================
+# STAFF COMMANDS
+# ============================================================
+
+async def add_staff(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    if update.message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if not is_authorized(update.message):
+
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    args = context.args or []
+
+    if not args or not args[0].lstrip("-").isdigit():
+
+        await update.message.reply_text(
+            "⚠️ Usage: /addstaff <telegram_id> [name]"
+        )
+
+        return
+
+    new_id = int(args[0])
+    name = " ".join(args[1:]) or "Staff"
+
+    await db_add_staff(new_id, name)
+    AUTHORIZED_STAFF.add(new_id)
+
+    await update.message.reply_text(
+        f"✅ {name} (ID: {new_id}) ab authorized staff hai."
+    )
+
+
+async def remove_staff(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    if update.message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if not is_authorized(update.message):
+
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    args = context.args or []
+
+    if not args or not args[0].lstrip("-").isdigit():
+
+        await update.message.reply_text(
+            "⚠️ Usage: /removestaff <telegram_id>"
+        )
+
+        return
+
+    remove_id = int(args[0])
+
+    await db_remove_staff(remove_id)
+    AUTHORIZED_STAFF.discard(remove_id)
+
+    await update.message.reply_text(
+        f"✅ ID {remove_id} ko staff se remove kar diya."
+    )
+
+
+async def list_staff(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    if update.message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    if not is_authorized(update.message):
+
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    ids_text = "\n".join(f"  {uid}" for uid in sorted(AUTHORIZED_STAFF)) or "  (none)"
+
+    await update.message.reply_text(
+        "👥 AUTHORIZED STAFF\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{ids_text}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    logger.error(
+        "Unhandled error: %s",
+        context.error,
+        exc_info=True
+    )
+
+
+# ============================================================
+# POST-INIT — register bot commands with Telegram
+# ============================================================
+
+async def post_init(application: Application):
+
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start or restart your support chat"),
+        BotCommand("help", "Show help and available commands"),
+        BotCommand("games", "Choose or change your game"),
+        BotCommand("support", "Reach our support team"),
+    ])
+
+    logger.info("Bot commands registered with Telegram.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 42)
+    print("       LUCKY HARBOR SUPPORT BOT")
+    print("=" * 42)
+
+    if not TOKEN:
+        print("❌ BOT_TOKEN not set!")
+        return
+
+    if not SUPPORT_GROUP_ID:
+        print("❌ SUPPORT_GROUP_ID not set!")
+        return
+
+    init_db()
+    load_staff_into_memory()
+
+    print(f"Support Group   : {SUPPORT_GROUP_ID}")
+    print(f"Authorized Staff: {AUTHORIZED_STAFF}")
+    print(f"Traffic Sources : {list(TRAFFIC_SOURCES.keys())}")
+    print("=" * 42)
+
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("games", games))
+    application.add_handler(CommandHandler("support", support))
+
+    # Callback handlers
+    application.add_handler(
+        CallbackQueryHandler(bonus_selected, pattern=r"^bonus:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(game_selected, pattern=r"^game:")
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "id", customer_info,
+            filters=filters.Chat(chat_id=SUPPORT_GROUP_ID)
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "close", close_topic,
+            filters=filters.Chat(chat_id=SUPPORT_GROUP_ID)
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats", stats,
+            filters=filters.Chat(chat_id=SUPPORT_GROUP_ID)
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "broadcast", broadcast,
+            filters=filters.Chat(chat_id=SUPPORT_GROUP_ID)
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "addstaff", add_staff,
+            filters=filters.Chat(chat_id=SUPPORT_GROUP_ID)
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removestaff", remove_staff,
+            filters=filters.Chat(chat_id=SUPPORT_GROUP_ID)
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "staff", list_staff,
+            filters=filters.Chat(chat_id=SUPPORT_GROUP_ID)
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & ~filters.COMMAND,
+            customer_message
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Chat(chat_id=SUPPORT_GROUP_ID) & ~filters.COMMAND,
+            support_group_message
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    print("Bot is running...")
+    print("=" * 42)
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
