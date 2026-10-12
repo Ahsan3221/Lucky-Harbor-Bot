@@ -93,3 +93,52 @@ def test_legacy_false_flag_no_longer_filters_registered_players(monkeypatch):
     asyncio.run(bot.deliver_job(types.SimpleNamespace(bot=api),s,
                                 {'user_id':77,'direction':'broadcast','body':'Promo'}))
     api.send_message.assert_awaited_once_with(chat_id=77,text='Promo')
+
+
+def test_broadcast_text_does_not_add_brand_header(monkeypatch):
+    bot=load_bot_stubbed(monkeypatch)
+    body='Hi Rachel 🙈 50% Deposit Bonus Activate| 🥳 Message Now and Claim!'
+    assert bot.clean_broadcast_body(body)==body
+    assert bot.clean_broadcast_body('📢 Lucky Harbor UPDATE\n\n'+body)==body
+    # Do not strip staff-authored words matching the brand inside the message.
+    assert bot.clean_broadcast_body('Hello! 📢 Lucky Harbor UPDATE\n\nOffer')=='Hello! 📢 Lucky Harbor UPDATE\n\nOffer'
+
+
+def test_pending_legacy_broadcast_delivers_only_actual_message(monkeypatch):
+    bot=load_bot_stubbed(monkeypatch)
+    customer='Hi Rachel 🙈 50% Deposit Bonus Activate| 🥳 Message Now and Claim!'
+    db=types.SimpleNamespace(user=AsyncMock(return_value={
+        'is_blocked':False,'bot_blocked':False,'marketing_opted_out':False}))
+    api=types.SimpleNamespace(send_message=AsyncMock())
+    s=types.SimpleNamespace(db=db,cfg=types.SimpleNamespace(group_id=-100111))
+    asyncio.run(bot.deliver_job(types.SimpleNamespace(bot=api),s,
+                                {'user_id':77,'direction':'broadcast',
+                                 'body':'📢 Lucky Harbor UPDATE\n\n'+customer}))
+    api.send_message.assert_awaited_once_with(chat_id=77,text=customer)
+
+
+def test_staff_topic_mirror_retains_sent_label_but_no_brand_header(monkeypatch):
+    bot=load_bot_stubbed(monkeypatch)
+    db=types.SimpleNamespace(
+        outbox_claim_mirror=AsyncMock(return_value={
+            'id':31,'attempts':1,'topic_id':345,'topic_status':'open',
+            'body':'📢 Lucky Harbor UPDATE\n\nHi Rachel 🙈'} ),
+        outbox_mirror_result=AsyncMock())
+    api=types.SimpleNamespace(send_message=AsyncMock())
+    s=types.SimpleNamespace(db=db,cfg=types.SimpleNamespace(
+        group_id=-100111,max_delivery_attempts=8))
+    asyncio.run(bot.mirror_one_broadcast(types.SimpleNamespace(bot=api),s))
+    api.send_message.assert_awaited_once_with(
+        chat_id=-100111,message_thread_id=345,
+        text='📢 BROADCAST SENT\n\nHi Rachel 🙈')
+    db.outbox_mirror_result.assert_awaited_once_with(31,True)
+
+
+def test_database_broadcast_generation_uses_only_staff_text_and_first_name():
+    from pathlib import Path
+    source=Path(__file__).resolve().parents[1].joinpath('database.py').read_text()
+    assert "content=row['body'].replace('{name}', first)" in source
+    assert 'content=f"📢 Lucky Harbor UPDATE' not in source
+    template='Hi {name} 🙈 50% Deposit Bonus Activate | minimum deposit $2'
+    assert template.replace('{name}','Rachel')==(
+        'Hi Rachel 🙈 50% Deposit Bonus Activate | minimum deposit $2')
